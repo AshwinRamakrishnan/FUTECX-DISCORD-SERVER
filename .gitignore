@@ -1,0 +1,56 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# SQLite (local dev only)
+*.db
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (dashboard)
+node_modules/
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Validation test scripts (not needed in production)
+live_*.py
+pre_deploy_audit.py
+run_tests.py
+
+# Local databases and backups
+futecx.db
+futecx.db.*
+*.bak
+*.backup
+
+# Local/generated files
+.pytest_cache/
+
+
+guild_dump.json
+
+
+guild_dump.json
+
