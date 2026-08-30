@@ -1,12 +1,11 @@
-import asyncio
-import os
+import hashlib
+import secrets
 import threading
 import uvicorn
 import logging
 import sys
 
 from fastapi.middleware.cors import CORSMiddleware
-
 from backend.api.main import app as fastapi_app
 from backend.bot.main import run_bot
 from backend.db.database import engine, Base
@@ -14,18 +13,84 @@ from backend.core.config import settings
 
 
 # ============================================================
-# PRODUCTION-SAFE LOGGING
+# PRODUCTION LOGGING
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 logger = logging.getLogger("futecx")
+
+
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
+
+def hash_password(password: str) -> str:
+    """
+    Secure password hashing using PBKDF2-HMAC-SHA256.
+
+    Unlike bcrypt, this does not have bcrypt's 72-byte
+    password limitation.
+    """
+
+    if not password:
+        raise ValueError("Admin password cannot be empty.")
+
+    password_bytes = password.encode("utf-8")
+
+    # Generate random salt
+    salt = secrets.token_bytes(16)
+
+    # PBKDF2 iterations
+    iterations = 600_000
+
+    derived_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        password_bytes,
+        salt,
+        iterations
+    )
+
+    return (
+        f"pbkdf2_sha256${iterations}$"
+        f"{salt.hex()}${derived_key.hex()}"
+    )
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """
+    Verify PBKDF2 password hash.
+    """
+
+    try:
+        algorithm, iterations, salt_hex, hash_hex = stored_hash.split("$")
+
+        if algorithm != "pbkdf2_sha256":
+            return False
+
+        iterations = int(iterations)
+
+        salt = bytes.fromhex(salt_hex)
+        expected_hash = bytes.fromhex(hash_hex)
+
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            iterations
+        )
+
+        return secrets.compare_digest(
+            actual_hash,
+            expected_hash
+        )
+
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -33,125 +98,159 @@ logger = logging.getLogger("futecx")
 # ============================================================
 
 def run_api():
-    """
-    Start FastAPI using Render's PORT environment variable.
-    Falls back to 8000 for local development.
-    """
-
-    port = int(os.getenv("PORT", "8000"))
-
-    logger.info(
-        f"Starting FastAPI server on 0.0.0.0:{port}"
-    )
+    logger.info("Starting FastAPI server on port 8000")
 
     uvicorn.run(
         fastapi_app,
         host="0.0.0.0",
-        port=port,
+        port=8000,
         log_level="info"
     )
 
 
 # ============================================================
-# DATABASE INITIALIZATION + ADMIN SEEDING
+# DATABASE INITIALIZATION
 # ============================================================
 
 def initialize_database():
-    """
-    Initialize database tables and create the initial admin user.
-    Works with both SQLite and PostgreSQL.
-    """
 
     logger.info("Initializing database schema...")
 
+    db = None
+
     try:
-        # ----------------------------------------------------
-        # Create all SQLAlchemy tables
-        # ----------------------------------------------------
-
-        Base.metadata.create_all(bind=engine)
-
-        logger.info(
-            "Database schema initialized successfully."
-        )
 
         # ----------------------------------------------------
-        # Seed initial admin user
+        # SQLite
+        # ----------------------------------------------------
+
+        if settings.database_url.startswith("sqlite"):
+
+            Base.metadata.create_all(bind=engine)
+
+            logger.info(
+                "Database schema initialized successfully (SQLite mode)."
+            )
+
+        # ----------------------------------------------------
+        # PostgreSQL
+        # ----------------------------------------------------
+
+        else:
+
+            logger.info(
+                "Production PostgreSQL detected."
+            )
+
+            # IMPORTANT:
+            # Do NOT query tables before they exist.
+            #
+            # If you are not using Alembic yet, create tables
+            # from SQLAlchemy metadata.
+            #
+            # This prevents:
+            # relation "admin_users" does not exist
+
+            Base.metadata.create_all(bind=engine)
+
+            logger.info(
+                "Database schema initialized successfully."
+            )
+
+        # ----------------------------------------------------
+        # IMPORT DB SESSION / MODEL
         # ----------------------------------------------------
 
         from backend.db.database import SessionLocal
         from backend.db.models import AdminUser
-        from passlib.context import CryptContext
 
         db = SessionLocal()
 
-        try:
-            pwd_context = CryptContext(
-                schemes=["bcrypt"],
-                deprecated="auto"
+        # ----------------------------------------------------
+        # CHECK ADMIN USER
+        # ----------------------------------------------------
+
+        admin_username = settings.admin_username
+        admin_password = settings.admin_password
+
+        if not admin_username:
+            raise ValueError(
+                "ADMIN_USERNAME environment variable is missing."
             )
 
-            admin = (
-                db.query(AdminUser)
-                .filter(
-                    AdminUser.username
-                    == settings.admin_username
-                )
-                .first()
+        if not admin_password:
+            raise ValueError(
+                "ADMIN_PASSWORD environment variable is missing."
             )
 
-            if not admin:
-                logger.info(
-                    f"Creating initial admin user: "
-                    f"{settings.admin_username}"
-                )
+        admin = (
+            db.query(AdminUser)
+            .filter(
+                AdminUser.username == admin_username
+            )
+            .first()
+        )
 
-                hashed_pw = pwd_context.hash(
-                    settings.admin_password
-                )
+        # ----------------------------------------------------
+        # CREATE ADMIN
+        # ----------------------------------------------------
 
-                new_admin = AdminUser(
-                    username=settings.admin_username,
-                    hashed_password=hashed_pw
-                )
+        if not admin:
 
-                db.add(new_admin)
-                db.commit()
+            logger.info(
+                f"Creating initial admin user: {admin_username}"
+            )
 
-                logger.info(
-                    "Initial admin user created successfully."
-                )
+            hashed_password = hash_password(
+                admin_password
+            )
 
-            else:
-                logger.info(
-                    "Admin user already exists. "
-                    "Skipping admin seeding."
-                )
+            new_admin = AdminUser(
+                username=admin_username,
+                hashed_password=hashed_password
+            )
 
-        finally:
-            db.close()
+            db.add(new_admin)
+            db.commit()
+
+            logger.info(
+                "Initial admin user created successfully."
+            )
+
+        else:
+
+            logger.info(
+                f"Admin user '{admin_username}' already exists."
+            )
 
     except Exception as e:
+
         logger.exception(
             f"Failed to initialize database: {e}"
         )
+
         raise
+
+    finally:
+
+        if db is not None:
+            db.close()
 
 
 # ============================================================
-# MAIN APPLICATION
+# APPLICATION ENTRY POINT
 # ============================================================
 
 def main():
 
     # --------------------------------------------------------
-    # Initialize PostgreSQL / SQLite database
+    # Initialize DB
     # --------------------------------------------------------
 
     initialize_database()
 
     # --------------------------------------------------------
-    # Start FastAPI in background thread
+    # Start FastAPI
     # --------------------------------------------------------
 
     api_thread = threading.Thread(
@@ -162,7 +261,7 @@ def main():
     api_thread.start()
 
     logger.info(
-        "FastAPI server started in background thread."
+        "FastAPI server thread started."
     )
 
     # --------------------------------------------------------
@@ -174,17 +273,26 @@ def main():
     )
 
     try:
+
         run_bot()
 
-    except Exception as e:
-        logger.exception(
-            f"Fatal Discord bot error: {e}"
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Discord bot stopped."
         )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Fatal bot error: {e}"
+        )
+
         raise
 
 
 # ============================================================
-# ENTRY POINT
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
